@@ -60,7 +60,7 @@ class GoogleMapsPlugin extends GoogleMapsFlutterPlatform {
     MarkerUpdates markerUpdates, {
     required int mapId,
   }) async {
-    _map(mapId).updateMarkers(markerUpdates);
+    await _map(mapId).updateMarkers(markerUpdates);
   }
 
   /// Applies the passed in `polygonUpdates` to the `mapId`.
@@ -90,6 +90,15 @@ class GoogleMapsPlugin extends GoogleMapsFlutterPlatform {
     _map(mapId).updateCircles(circleUpdates);
   }
 
+  /// Applies the passed in `heatmapUpdates` to the `mapId`.
+  @override
+  Future<void> updateHeatmaps(
+    HeatmapUpdates heatmapUpdates, {
+    required int mapId,
+  }) async {
+    _map(mapId).updateHeatmaps(heatmapUpdates);
+  }
+
   @override
   Future<void> updateTileOverlays({
     required Set<TileOverlay> newTileOverlays,
@@ -104,6 +113,14 @@ class GoogleMapsPlugin extends GoogleMapsFlutterPlatform {
     required int mapId,
   }) async {
     _map(mapId).updateClusterManagers(clusterManagerUpdates);
+  }
+
+  @override
+  Future<void> updateGroundOverlays(
+    GroundOverlayUpdates groundOverlayUpdates, {
+    required int mapId,
+  }) async {
+    _map(mapId).updateGroundOverlays(groundOverlayUpdates);
   }
 
   @override
@@ -293,6 +310,11 @@ class GoogleMapsPlugin extends GoogleMapsFlutterPlatform {
   }
 
   @override
+  Stream<GroundOverlayTapEvent> onGroundOverlayTap({required int mapId}) {
+    return _events(mapId).whereType<GroundOverlayTapEvent>();
+  }
+
+  @override
   Future<String?> getStyleError({required int mapId}) async {
     return _map(mapId).lastStyleError;
   }
@@ -353,6 +375,7 @@ class GoogleMapsPlugin extends GoogleMapsFlutterPlatform {
     GoogleMapsInspectorPlatform.instance = GoogleMapsInspectorWeb(
       (int mapId) => _map(mapId).configuration,
       (int mapId) => _map(mapId).clusterManagersController,
+      (int mapId) => _map(mapId).groundOverlayController,
     );
   }
 }

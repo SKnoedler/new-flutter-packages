@@ -13,10 +13,16 @@ import 'package:google_maps_flutter_platform_interface/google_maps_flutter_platf
 import 'package:stream_transform/stream_transform.dart';
 
 import 'google_map_inspector_android.dart';
-import 'utils/cluster_manager_utils.dart';
+import 'messages.g.dart';
+import 'serialization.dart';
 
 // TODO(stuartmorgan): Remove the dependency on platform interface toJson
 // methods. Channel serialization details should all be package-internal.
+
+/// The non-test implementation of `_apiProvider`.
+MapsApi _productionApiProvider(int mapId) {
+  return MapsApi(messageChannelSuffix: mapId.toString());
+}
 
 /// Error thrown when an unknown map ID is provided to a method channel API.
 class UnknownMapIDError extends Error {
@@ -54,49 +60,75 @@ enum AndroidMapRenderer {
 
 /// An implementation of [GoogleMapsFlutterPlatform] for Android.
 class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
+  /// Creates a new Android maps implementation instance.
+  GoogleMapsFlutterAndroid({
+    @visibleForTesting MapsApi Function(int mapId)? apiProvider,
+  }) : _apiProvider = apiProvider ?? _productionApiProvider;
+
   /// Registers the Android implementation of GoogleMapsFlutterPlatform.
   static void registerWith() {
     GoogleMapsFlutterPlatform.instance = GoogleMapsFlutterAndroid();
   }
 
-  /// The method channel used to initialize the native Google Maps SDK.
-  final MethodChannel _initializerChannel = const MethodChannel(
-      'plugins.flutter.dev/google_maps_android_initializer');
+  final Map<int, MapsApi> _hostMaps = <int, MapsApi>{};
 
-  // Keep a collection of id -> channel
-  // Every method call passes the int mapId
-  final Map<int, MethodChannel> _channels = <int, MethodChannel>{};
+  // A method to create MapsApi instances, which can be overridden for testing.
+  final MapsApi Function(int mapId) _apiProvider;
 
-  /// Accesses the MethodChannel associated to the passed mapId.
-  MethodChannel _channel(int mapId) {
-    final MethodChannel? channel = _channels[mapId];
-    if (channel == null) {
+  /// The per-map handlers for callbacks from the host side.
+  @visibleForTesting
+  final Map<int, HostMapMessageHandler> hostMapHandlers =
+      <int, HostMapMessageHandler>{};
+
+  /// Accesses the MapsApi associated to the passed mapId.
+  MapsApi _hostApi(int mapId) {
+    final MapsApi? api = _hostMaps[mapId];
+    if (api == null) {
       throw UnknownMapIDError(mapId);
     }
-    return channel;
+    return api;
   }
 
   // Keep a collection of mapId to a map of TileOverlays.
   final Map<int, Map<TileOverlayId, TileOverlay>> _tileOverlays =
       <int, Map<TileOverlayId, TileOverlay>>{};
 
-  /// Returns the channel for [mapId], creating it if it doesn't already exist.
+  /// Returns the handler for [mapId], creating it if it doesn't already exist.
   @visibleForTesting
-  MethodChannel ensureChannelInitialized(int mapId) {
-    MethodChannel? channel = _channels[mapId];
-    if (channel == null) {
-      channel = MethodChannel('plugins.flutter.dev/google_maps_android_$mapId');
-      channel.setMethodCallHandler(
-          (MethodCall call) => _handleMethodCall(call, mapId));
-      _channels[mapId] = channel;
+  HostMapMessageHandler ensureHandlerInitialized(int mapId) {
+    HostMapMessageHandler? handler = hostMapHandlers[mapId];
+    if (handler == null) {
+      handler = HostMapMessageHandler(
+        mapId,
+        _mapEventStreamController,
+        tileOverlayProvider: (TileOverlayId tileOverlayId) {
+          final Map<TileOverlayId, TileOverlay>? tileOverlaysForMap =
+              _tileOverlays[mapId];
+          return tileOverlaysForMap?[tileOverlayId];
+        },
+      );
+      hostMapHandlers[mapId] = handler;
     }
-    return channel;
+    return handler;
+  }
+
+  /// Returns the API instance for [mapId], creating it if it doesn't already
+  /// exist.
+  @visibleForTesting
+  MapsApi ensureApiInitialized(int mapId) {
+    MapsApi? api = _hostMaps[mapId];
+    if (api == null) {
+      api = _apiProvider(mapId);
+      _hostMaps[mapId] ??= api;
+    }
+    return api;
   }
 
   @override
   Future<void> init(int mapId) {
-    final MethodChannel channel = ensureChannelInitialized(mapId);
-    return channel.invokeMethod<void>('map#waitForMap');
+    ensureHandlerInitialized(mapId);
+    final MapsApi hostApi = ensureApiInitialized(mapId);
+    return hostApi.waitForMap();
   }
 
   @override
@@ -170,6 +202,11 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
   @override
   Stream<CircleTapEvent> onCircleTap({required int mapId}) {
     return _events(mapId).whereType<CircleTapEvent>();
+  }
+
+  @override
+  Stream<GroundOverlayTapEvent> onGroundOverlayTap({required int mapId}) {
+    return _events(mapId).whereType<GroundOverlayTapEvent>();
   }
 
   @override
@@ -316,6 +353,13 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
   /// arguments are known to be a map.
   Map<String, Object?> _getArgumentDictionary(MethodCall call) {
     return (call.arguments as Map<Object?, Object?>).cast<String, Object?>();
+  @override
+  Future<void> updateMapConfiguration(
+    MapConfiguration configuration, {
+    required int mapId,
+  }) {
+    return _hostApi(mapId).updateMapConfiguration(
+        _platformMapConfigurationFromMapConfiguration(configuration));
   }
 
   @override
@@ -323,12 +367,8 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     Map<String, dynamic> optionsUpdate, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>(
-      'map#update',
-      <String, dynamic>{
-        'options': optionsUpdate,
-      },
-    );
+    return _hostApi(mapId).updateMapConfiguration(
+        _platformMapConfigurationFromOptionsJson(optionsUpdate));
   }
 
   @override
@@ -336,9 +376,10 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     MarkerUpdates markerUpdates, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>(
-      'markers#update',
-      markerUpdates.toJson(),
+    return _hostApi(mapId).updateMarkers(
+      markerUpdates.markersToAdd.map(platformMarkerFromMarker).toList(),
+      markerUpdates.markersToChange.map(platformMarkerFromMarker).toList(),
+      markerUpdates.markerIdsToRemove.map((MarkerId id) => id.value).toList(),
     );
   }
 
@@ -347,9 +388,12 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     PolygonUpdates polygonUpdates, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>(
-      'polygons#update',
-      polygonUpdates.toJson(),
+    return _hostApi(mapId).updatePolygons(
+      polygonUpdates.polygonsToAdd.map(platformPolygonFromPolygon).toList(),
+      polygonUpdates.polygonsToChange.map(platformPolygonFromPolygon).toList(),
+      polygonUpdates.polygonIdsToRemove
+          .map((PolygonId id) => id.value)
+          .toList(),
     );
   }
 
@@ -358,9 +402,16 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     PolylineUpdates polylineUpdates, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>(
-      'polylines#update',
-      polylineUpdates.toJson(),
+    return _hostApi(mapId).updatePolylines(
+      polylineUpdates.polylinesToAdd
+          .map(platformPolylineFromPolyline)
+          .toList(),
+      polylineUpdates.polylinesToChange
+          .map(platformPolylineFromPolyline)
+          .toList(),
+      polylineUpdates.polylineIdsToRemove
+          .map((PolylineId id) => id.value)
+          .toList(),
     );
   }
 
@@ -369,9 +420,24 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     CircleUpdates circleUpdates, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>(
-      'circles#update',
-      circleUpdates.toJson(),
+    return _hostApi(mapId).updateCircles(
+      circleUpdates.circlesToAdd.map(platformCircleFromCircle).toList(),
+      circleUpdates.circlesToChange.map(platformCircleFromCircle).toList(),
+      circleUpdates.circleIdsToRemove.map((CircleId id) => id.value).toList(),
+    );
+  }
+
+  @override
+  Future<void> updateHeatmaps(
+    HeatmapUpdates heatmapUpdates, {
+    required int mapId,
+  }) {
+    return _hostApi(mapId).updateHeatmaps(
+      heatmapUpdates.heatmapsToAdd.map(platformHeatmapFromHeatmap).toList(),
+      heatmapUpdates.heatmapsToChange.map(platformHeatmapFromHeatmap).toList(),
+      heatmapUpdates.heatmapIdsToRemove
+          .map((HeatmapId id) => id.value)
+          .toList(),
     );
   }
 
@@ -388,9 +454,16 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     final _TileOverlayUpdates updates =
         _TileOverlayUpdates.from(previousSet, newTileOverlays);
     _tileOverlays[mapId] = keyTileOverlayId(newTileOverlays);
-    return _channel(mapId).invokeMethod<void>(
-      'tileOverlays#update',
-      updates.toJson(),
+    return _hostApi(mapId).updateTileOverlays(
+      updates.tileOverlaysToAdd
+          .map(platformTileOverlayFromTileOverlay)
+          .toList(),
+      updates.tileOverlaysToChange
+          .map(platformTileOverlayFromTileOverlay)
+          .toList(),
+      updates.tileOverlayIdsToRemove
+          .map((TileOverlayId id) => id.value)
+          .toList(),
     );
   }
 
@@ -399,9 +472,37 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     ClusterManagerUpdates clusterManagerUpdates, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>(
-      'clusterManagers#update',
-      serializeClusterManagerUpdates(clusterManagerUpdates),
+    return _hostApi(mapId).updateClusterManagers(
+      clusterManagerUpdates.clusterManagersToAdd
+          .map(platformClusterManagerFromClusterManager)
+          .toList(),
+      clusterManagerUpdates.clusterManagerIdsToRemove
+          .map((ClusterManagerId id) => id.value)
+          .toList(),
+    );
+  }
+
+  @override
+  Future<void> updateGroundOverlays(
+    GroundOverlayUpdates groundOverlayUpdates, {
+    required int mapId,
+  }) {
+    assert(
+        groundOverlayUpdates.groundOverlaysToAdd.every(
+            (GroundOverlay groundOverlay) =>
+                groundOverlay.position == null || groundOverlay.width != null),
+        'On Android width must be set when position is set for ground overlays.');
+
+    return _hostApi(mapId).updateGroundOverlays(
+      groundOverlayUpdates.groundOverlaysToAdd
+          .map(platformGroundOverlayFromGroundOverlay)
+          .toList(),
+      groundOverlayUpdates.groundOverlaysToChange
+          .map(platformGroundOverlayFromGroundOverlay)
+          .toList(),
+      groundOverlayUpdates.groundOverlayIdsToRemove
+          .map((GroundOverlayId id) => id.value)
+          .toList(),
     );
   }
 
@@ -410,10 +511,7 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     TileOverlayId tileOverlayId, {
     required int mapId,
   }) {
-    return _channel(mapId)
-        .invokeMethod<void>('tileOverlays#clearTileCache', <String, Object>{
-      'tileOverlayId': tileOverlayId.value,
-    });
+    return _hostApi(mapId).clearTileCache(tileOverlayId.value);
   }
 
   @override
@@ -421,10 +519,20 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     CameraUpdate cameraUpdate, {
     required int mapId,
   }) {
-    return _channel(mapId)
-        .invokeMethod<void>('camera#animate', <String, Object>{
-      'cameraUpdate': cameraUpdate.toJson(),
-    });
+    return animateCameraWithConfiguration(
+        cameraUpdate, const CameraUpdateAnimationConfiguration(),
+        mapId: mapId);
+  }
+
+  @override
+  Future<void> animateCameraWithConfiguration(
+    CameraUpdate cameraUpdate,
+    CameraUpdateAnimationConfiguration configuration, {
+    required int mapId,
+  }) {
+    return _hostApi(mapId).animateCamera(
+        platformCameraUpdateFromCameraUpdate(cameraUpdate),
+        configuration.duration?.inMilliseconds);
   }
 
   @override
@@ -432,9 +540,8 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     CameraUpdate cameraUpdate, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>('camera#move', <String, dynamic>{
-      'cameraUpdate': cameraUpdate.toJson(),
-    });
+    return _hostApi(mapId)
+        .moveCamera(platformCameraUpdateFromCameraUpdate(cameraUpdate));
   }
 
   @override
@@ -442,11 +549,9 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     String? mapStyle, {
     required int mapId,
   }) async {
-    final List<dynamic> successAndError = (await _channel(mapId)
-        .invokeMethod<List<dynamic>>('map#setStyle', mapStyle))!;
-    final bool success = successAndError[0] as bool;
+    final bool success = await _hostApi(mapId).setStyle(mapStyle ?? '');
     if (!success) {
-      throw MapStyleException(successAndError[1] as String);
+      throw const MapStyleException(_setStyleFailureMessage);
     }
   }
 
@@ -454,12 +559,8 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
   Future<LatLngBounds> getVisibleRegion({
     required int mapId,
   }) async {
-    final Map<String, dynamic> latLngBounds = (await _channel(mapId)
-        .invokeMapMethod<String, dynamic>('map#getVisibleRegion'))!;
-    final LatLng southwest = LatLng.fromJson(latLngBounds['southwest'])!;
-    final LatLng northeast = LatLng.fromJson(latLngBounds['northeast'])!;
-
-    return LatLngBounds(northeast: northeast, southwest: southwest);
+    return _latLngBoundsFromPlatformLatLngBounds(
+        await _hostApi(mapId).getVisibleRegion());
   }
 
   @override
@@ -467,11 +568,8 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     LatLng latLng, {
     required int mapId,
   }) async {
-    final Map<String, int> point = (await _channel(mapId)
-        .invokeMapMethod<String, int>(
-            'map#getScreenCoordinate', latLng.toJson()))!;
-
-    return ScreenCoordinate(x: point['x']!, y: point['y']!);
+    return screenCoordinateFromPlatformPoint(await _hostApi(mapId)
+        .getScreenCoordinate(platformLatLngFromLatLng(latLng)));
   }
 
   @override
@@ -479,10 +577,8 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     ScreenCoordinate screenCoordinate, {
     required int mapId,
   }) async {
-    final List<dynamic> latLng = (await _channel(mapId)
-        .invokeMethod<List<dynamic>>(
-            'map#getLatLng', screenCoordinate.toJson()))!;
-    return LatLng(latLng[0] as double, latLng[1] as double);
+    return _latLngFromPlatformLatLng(await _hostApi(mapId)
+        .getLatLng(platformPointFromScreenCoordinate(screenCoordinate)));
   }
 
   @override
@@ -490,8 +586,7 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     MarkerId markerId, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>(
-        'markers#showInfoWindow', <String, String>{'markerId': markerId.value});
+    return _hostApi(mapId).showInfoWindow(markerId.value);
   }
 
   @override
@@ -499,37 +594,36 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     MarkerId markerId, {
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<void>(
-        'markers#hideInfoWindow', <String, String>{'markerId': markerId.value});
+    return _hostApi(mapId).hideInfoWindow(markerId.value);
   }
 
   @override
   Future<bool> isMarkerInfoWindowShown(
     MarkerId markerId, {
     required int mapId,
-  }) async {
-    return (await _channel(mapId).invokeMethod<bool>(
-        'markers#isInfoWindowShown',
-        <String, String>{'markerId': markerId.value}))!;
+  }) {
+    return _hostApi(mapId).isInfoWindowShown(markerId.value);
   }
 
   @override
   Future<double> getZoomLevel({
     required int mapId,
-  }) async {
-    return (await _channel(mapId).invokeMethod<double>('map#getZoomLevel'))!;
+  }) {
+    return _hostApi(mapId).getZoomLevel();
   }
 
   @override
   Future<Uint8List?> takeSnapshot({
     required int mapId,
   }) {
-    return _channel(mapId).invokeMethod<Uint8List>('map#takeSnapshot');
+    return _hostApi(mapId).takeSnapshot();
   }
 
   @override
-  Future<String?> getStyleError({required int mapId}) {
-    return _channel(mapId).invokeMethod<String>('map#getStyleError');
+  Future<String?> getStyleError({required int mapId}) async {
+    return (await _hostApi(mapId).didLastStyleSucceed())
+        ? null
+        : _setStyleFailureMessage;
   }
 
   /// Set [GoogleMapsFlutterPlatform] to use [AndroidViewSurface] to build the
@@ -539,7 +633,7 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
   /// for more information.
   ///
   /// Currently defaults to false, but the default is subject to change.
-  bool useAndroidViewSurface = false;
+  const bool useAndroidViewSurface = false;
 
   /// Requests Google Map Renderer with [AndroidMapRenderer] type.
   ///
@@ -554,56 +648,64 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
   /// Initialized [AndroidMapRenderer] type is returned.
   Future<AndroidMapRenderer> initializeWithRenderer(
       AndroidMapRenderer? rendererType) async {
-    String preferredRenderer;
+    PlatformRendererType? preferredRenderer;
     switch (rendererType) {
       case AndroidMapRenderer.latest:
-        preferredRenderer = 'latest';
+        preferredRenderer = PlatformRendererType.latest;
       case AndroidMapRenderer.legacy:
-        preferredRenderer = 'legacy';
+        preferredRenderer = PlatformRendererType.legacy;
       case AndroidMapRenderer.platformDefault:
       case null:
-        preferredRenderer = 'default';
+        preferredRenderer = null;
     }
 
-    final String? initializedRenderer = await _initializerChannel
-        .invokeMethod<String>('initializer#preferRenderer',
-            <String, dynamic>{'value': preferredRenderer});
+    final MapsInitializerApi hostApi = MapsInitializerApi();
+    final PlatformRendererType initializedRenderer =
+        await hostApi.initializeWithPreferredRenderer(preferredRenderer);
 
-    if (initializedRenderer == null) {
-      throw AndroidMapRendererException('Failed to initialize map renderer.');
-    }
-
-    // Returns mapped [AndroidMapRenderer] enum type.
-    switch (initializedRenderer) {
-      case 'latest':
-        return AndroidMapRenderer.latest;
-      case 'legacy':
-        return AndroidMapRenderer.legacy;
-      default:
-        throw AndroidMapRendererException(
-            'Failed to initialize latest or legacy renderer, got $initializedRenderer.');
-    }
+    return switch (initializedRenderer) {
+      PlatformRendererType.latest => AndroidMapRenderer.latest,
+      PlatformRendererType.legacy => AndroidMapRenderer.legacy,
+    };
   }
 
-  Widget _buildView(
+  Widget buildView(
     int creationId,
     PlatformViewCreatedCallback onPlatformViewCreated, {
+    required PlatformMapConfiguration mapConfiguration,
     required MapWidgetConfiguration widgetConfiguration,
     MapObjects mapObjects = const MapObjects(),
-    Map<String, dynamic> mapOptions = const <String, dynamic>{},
   }) {
-    final Map<String, dynamic> creationParams = <String, dynamic>{
-      'initialCameraPosition':
-          widgetConfiguration.initialCameraPosition.toMap(),
-      'options': mapOptions,
-      'markersToAdd': serializeMarkerSet(mapObjects.markers),
-      'polygonsToAdd': serializePolygonSet(mapObjects.polygons),
-      'polylinesToAdd': serializePolylineSet(mapObjects.polylines),
-      'circlesToAdd': serializeCircleSet(mapObjects.circles),
-      'tileOverlaysToAdd': serializeTileOverlaySet(mapObjects.tileOverlays),
-      'clusterManagersToAdd':
-          serializeClusterManagerSet(mapObjects.clusterManagers),
-    };
+    assert(
+        mapObjects.groundOverlays.every((GroundOverlay groundOverlay) =>
+            groundOverlay.position == null || groundOverlay.width != null),
+        'On Android width must be set when position is set for ground overlays.');
+
+    final PlatformMapViewCreationParams creationParams =
+        PlatformMapViewCreationParams(
+      initialCameraPosition: _platformCameraPositionFromCameraPosition(
+          widgetConfiguration.initialCameraPosition),
+      mapConfiguration: mapConfiguration,
+      initialMarkers:
+          mapObjects.markers.map(platformMarkerFromMarker).toList(),
+      initialPolygons:
+          mapObjects.polygons.map(platformPolygonFromPolygon).toList(),
+      initialPolylines:
+          mapObjects.polylines.map(platformPolylineFromPolyline).toList(),
+      initialCircles:
+          mapObjects.circles.map(platformCircleFromCircle).toList(),
+      initialHeatmaps:
+          mapObjects.heatmaps.map(platformHeatmapFromHeatmap).toList(),
+      initialTileOverlays: mapObjects.tileOverlays
+          .map(platformTileOverlayFromTileOverlay)
+          .toList(),
+      initialClusterManagers: mapObjects.clusterManagers
+          .map(platformClusterManagerFromClusterManager)
+          .toList(),
+      initialGroundOverlays: mapObjects.groundOverlays
+          .map(platformGroundOverlayFromGroundOverlay)
+          .toList(),
+    );
 
     const String viewType = 'plugins.flutter.dev/google_maps_android';
     if (useAndroidViewSurface) {
@@ -626,7 +728,7 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
             viewType: viewType,
             layoutDirection: widgetConfiguration.textDirection,
             creationParams: creationParams,
-            creationParamsCodec: const StandardMessageCodec(),
+            creationParamsCodec: MapsApi.pigeonChannelCodec,
             onFocus: () => params.onFocusChanged(true),
           );
           controller.addOnPlatformViewCreatedListener(
@@ -647,7 +749,7 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
         gestureRecognizers: widgetConfiguration.gestureRecognizers,
         layoutDirection: widgetConfiguration.textDirection,
         creationParams: creationParams,
-        creationParamsCodec: const StandardMessageCodec(),
+        creationParamsCodec: MapsApi.pigeonChannelCodec,
       );
     }
   }
@@ -660,12 +762,13 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     MapConfiguration mapConfiguration = const MapConfiguration(),
     MapObjects mapObjects = const MapObjects(),
   }) {
-    return _buildView(
+    return buildView(
       creationId,
       onPlatformViewCreated,
       widgetConfiguration: widgetConfiguration,
       mapObjects: mapObjects,
-      mapOptions: _jsonForMapConfiguration(mapConfiguration),
+      mapConfiguration:
+          _platformMapConfigurationFromMapConfiguration(mapConfiguration),
     );
   }
 
@@ -684,7 +787,7 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
     Set<Factory<OneSequenceGestureRecognizer>>? gestureRecognizers,
     Map<String, dynamic> mapOptions = const <String, dynamic>{},
   }) {
-    return _buildView(
+    return buildView(
       creationId,
       onPlatformViewCreated,
       widgetConfiguration: MapWidgetConfiguration(
@@ -697,7 +800,7 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
           circles: circles,
           clusterManagers: clusterManagers,
           tileOverlays: tileOverlays),
-      mapOptions: mapOptions,
+      mapConfiguration: _platformMapConfigurationFromOptionsJson(mapOptions),
     );
   }
 
@@ -734,93 +837,722 @@ class GoogleMapsFlutterAndroid extends GoogleMapsFlutterPlatform {
   @override
   @visibleForTesting
   void enableDebugInspection() {
-    GoogleMapsInspectorPlatform.instance =
-        GoogleMapsInspectorAndroid((int mapId) => _channel(mapId));
+    GoogleMapsInspectorPlatform.instance = GoogleMapsInspectorAndroid(
+        (int mapId) =>
+            MapsInspectorApi(messageChannelSuffix: mapId.toString()));
   }
 
-  /// Parses cluster data from dynamic json objects and returns [Cluster] object.
-  /// Used by the `cluster#onTap` method call handler and the
-  /// [GoogleMapsInspectorAndroid.getClusters] response parser.
-  static Cluster parseCluster(
-      String clusterManagerIdString,
-      Object positionObject,
-      Map<dynamic, dynamic> boundsMap,
-      List<dynamic> markerIdsList) {
-    final ClusterManagerId clusterManagerId =
-        ClusterManagerId(clusterManagerIdString);
-    final LatLng position = LatLng.fromJson(positionObject)!;
-
-    final Map<String, List<dynamic>> latLngData = boundsMap.map(
-        (dynamic key, dynamic object) => MapEntry<String, List<dynamic>>(
-            key as String, object as List<dynamic>));
-
-    final LatLngBounds bounds = LatLngBounds(
-        northeast: LatLng.fromJson(latLngData['northeast'])!,
-        southwest: LatLng.fromJson(latLngData['southwest'])!);
-
-    final List<MarkerId> markerIds = markerIdsList
-        .map((dynamic markerId) => MarkerId(markerId as String))
-        .toList();
-
+  /// Converts a Pigeon [PlatformCluster] to the corresponding [Cluster].
+  Cluster clusterFromPlatformCluster(PlatformCluster cluster) {
     return Cluster(
-      clusterManagerId,
-      markerIds,
-      position: position,
-      bounds: bounds,
+        ClusterManagerId(cluster.clusterManagerId),
+        cluster.markerIds
+            // See comment in messages.dart for why the force unwrap is okay.
+            .map((String? markerId) => MarkerId(markerId!))
+            .toList(),
+        position: _latLngFromPlatformLatLng(cluster.position),
+        bounds: _latLngBoundsFromPlatformLatLngBounds(cluster.bounds));
+  }
+
+  PlatformLatLng platformLatLngFromLatLng(LatLng latLng) {
+    return PlatformLatLng(
+        latitude: latLng.latitude, longitude: latLng.longitude);
+  }
+
+  PlatformDoublePair platformPairFromOffset(Offset offset) {
+    return PlatformDoublePair(x: offset.dx, y: offset.dy);
+  }
+
+  PlatformDoublePair platformPairFromSize(Size size) {
+    return PlatformDoublePair(x: size.width, y: size.height);
+  }
+
+  ScreenCoordinate screenCoordinateFromPlatformPoint(
+      PlatformPoint point) {
+    return ScreenCoordinate(x: point.x, y: point.y);
+  }
+
+  PlatformPoint platformPointFromScreenCoordinate(
+      ScreenCoordinate coordinate) {
+    return PlatformPoint(x: coordinate.x, y: coordinate.y);
+  }
+
+  PlatformCircle platformCircleFromCircle(Circle circle) {
+    return PlatformCircle(
+      consumeTapEvents: circle.consumeTapEvents,
+      fillColor: circle.fillColor.value,
+      strokeColor: circle.strokeColor.value,
+      visible: circle.visible,
+      strokeWidth: circle.strokeWidth,
+      zIndex: circle.zIndex.toDouble(),
+      center: platformLatLngFromLatLng(circle.center),
+      radius: circle.radius,
+      circleId: circle.circleId.value,
     );
+  }
+
+  PlatformHeatmap platformHeatmapFromHeatmap(Heatmap heatmap) {
+    return PlatformHeatmap(json: serializeHeatmap(heatmap));
+  }
+
+  PlatformClusterManager platformClusterManagerFromClusterManager(
+      ClusterManager clusterManager) {
+    return PlatformClusterManager(
+        identifier: clusterManager.clusterManagerId.value);
+  }
+
+  PlatformInfoWindow platformInfoWindowFromInfoWindow(
+      InfoWindow window) {
+    return PlatformInfoWindow(
+        title: window.title,
+        snippet: window.snippet,
+        anchor: platformPairFromOffset(window.anchor));
+  }
+
+  PlatformMarker platformMarkerFromMarker(Marker marker) {
+    return PlatformMarker(
+      alpha: marker.alpha,
+      anchor: platformPairFromOffset(marker.anchor),
+      consumeTapEvents: marker.consumeTapEvents,
+      draggable: marker.draggable,
+      flat: marker.flat,
+      icon: platformBitmapFromBitmapDescriptor(marker.icon),
+      infoWindow: platformInfoWindowFromInfoWindow(marker.infoWindow),
+      position: platformLatLngFromLatLng(marker.position),
+      rotation: marker.rotation,
+      visible: marker.visible,
+      zIndex: marker.zIndex,
+      markerId: marker.markerId.value,
+      clusterManagerId: marker.clusterManagerId?.value,
+    );
+  }
+
+  PlatformGroundOverlay platformGroundOverlayFromGroundOverlay(
+      GroundOverlay groundOverlay) {
+    return PlatformGroundOverlay(
+      groundOverlayId: groundOverlay.groundOverlayId.value,
+      anchor: groundOverlay.anchor != null
+          ? platformPairFromOffset(groundOverlay.anchor)
+          : null,
+      image: platformBitmapFromBitmapDescriptor(groundOverlay.image),
+      position: groundOverlay.position != null
+          ? platformLatLngFromLatLng(groundOverlay.position)
+          : null,
+      bounds: _platformLatLngBoundsFromLatLngBounds(groundOverlay.bounds),
+      visible: groundOverlay.visible,
+      zIndex: groundOverlay.zIndex,
+      bearing: groundOverlay.bearing,
+      clickable: groundOverlay.clickable,
+      transparency: groundOverlay.transparency,
+      width: groundOverlay.width,
+      height: groundOverlay.height,
+    );
+  }
+
+  PlatformPolygon platformPolygonFromPolygon(Polygon polygon) {
+    final List<PlatformLatLng> points =
+        polygon.points.map(platformLatLngFromLatLng).toList();
+    final List<List<PlatformLatLng>> holes =
+        polygon.holes.map((List<LatLng> hole) {
+      return hole.map(platformLatLngFromLatLng).toList();
+    }).toList();
+    return PlatformPolygon(
+      polygonId: polygon.polygonId.value,
+      fillColor: polygon.fillColor.value,
+      geodesic: polygon.geodesic,
+      consumesTapEvents: polygon.consumeTapEvents,
+      points: points,
+      holes: holes,
+      strokeColor: polygon.strokeColor.value,
+      strokeWidth: polygon.strokeWidth,
+      zIndex: polygon.zIndex,
+      visible: polygon.visible,
+    );
+  }
+
+  PlatformPolyline platformPolylineFromPolyline(Polyline polyline) {
+    final List<PlatformLatLng> points =
+        polyline.points.map(platformLatLngFromLatLng).toList();
+    final List<PlatformPatternItem> pattern =
+        polyline.patterns.map(platformPatternItemFromPatternItem).toList();
+    return PlatformPolyline(
+      polylineId: polyline.polylineId.value,
+      consumesTapEvents: polyline.consumeTapEvents,
+      color: polyline.color.value,
+      startCap: platformCapFromCap(polyline.startCap),
+      endCap: platformCapFromCap(polyline.endCap),
+      geodesic: polyline.geodesic,
+      visible: polyline.visible,
+      width: polyline.width,
+      zIndex: polyline.zIndex,
+      points: points,
+      jointType: platformJointTypeFromJointType(polyline.jointType),
+      patterns: pattern,
+    );
+  }
+
+  PlatformTileOverlay platformTileOverlayFromTileOverlay(
+      TileOverlay tileOverlay) {
+    return PlatformTileOverlay(
+      tileOverlayId: tileOverlay.tileOverlayId.value,
+      fadeIn: tileOverlay.fadeIn,
+      transparency: tileOverlay.transparency,
+      zIndex: tileOverlay.zIndex,
+      visible: tileOverlay.visible,
+      tileSize: tileOverlay.tileSize,
+    );
+  }
+
+  PlatformCameraUpdate platformCameraUpdateFromCameraUpdate(
+      CameraUpdate update) {
+    switch (update.updateType) {
+      case CameraUpdateType.newCameraPosition:
+        update as CameraUpdateNewCameraPosition;
+        return PlatformCameraUpdate(
+            cameraUpdate: PlatformCameraUpdateNewCameraPosition(
+                cameraPosition: _platformCameraPositionFromCameraPosition(
+                    update.cameraPosition)));
+      case CameraUpdateType.newLatLng:
+        update as CameraUpdateNewLatLng;
+        return PlatformCameraUpdate(
+            cameraUpdate: PlatformCameraUpdateNewLatLng(
+                latLng: platformLatLngFromLatLng(update.latLng)));
+      case CameraUpdateType.newLatLngZoom:
+        update as CameraUpdateNewLatLngZoom;
+        return PlatformCameraUpdate(
+            cameraUpdate: PlatformCameraUpdateNewLatLngZoom(
+                latLng: platformLatLngFromLatLng(update.latLng),
+                zoom: update.zoom));
+      case CameraUpdateType.newLatLngBounds:
+        update as CameraUpdateNewLatLngBounds;
+        return PlatformCameraUpdate(
+            cameraUpdate: PlatformCameraUpdateNewLatLngBounds(
+                bounds: _platformLatLngBoundsFromLatLngBounds(update.bounds)!,
+                padding: update.padding));
+      case CameraUpdateType.zoomTo:
+        update as CameraUpdateZoomTo;
+        return PlatformCameraUpdate(
+            cameraUpdate: PlatformCameraUpdateZoomTo(zoom: update.zoom));
+      case CameraUpdateType.zoomBy:
+        update as CameraUpdateZoomBy;
+        return PlatformCameraUpdate(
+            cameraUpdate: PlatformCameraUpdateZoomBy(
+                amount: update.amount,
+                focus: update.focus == null
+                    ? null
+                    : platformPairFromOffset(update.focus)));
+      case CameraUpdateType.zoomIn:
+        update as CameraUpdateZoomIn;
+        return PlatformCameraUpdate(
+            cameraUpdate: PlatformCameraUpdateZoom(out: false));
+      case CameraUpdateType.zoomOut:
+        update as CameraUpdateZoomOut;
+        return PlatformCameraUpdate(
+            cameraUpdate: PlatformCameraUpdateZoom(out: true));
+      case CameraUpdateType.scrollBy:
+        update as CameraUpdateScrollBy;
+        return PlatformCameraUpdate(
+            cameraUpdate:
+                PlatformCameraUpdateScrollBy(dx: update.dx, dy: update.dy));
+    }
+  }
+
+  /// Convert [MapBitmapScaling] from platform interface to [PlatformMapBitmapScaling] Pigeon.
+  @visibleForTesting
+  PlatformMapBitmapScaling platformMapBitmapScalingFromScaling(
+      MapBitmapScaling scaling) {
+    switch (scaling) {
+      case MapBitmapScaling.auto:
+        return PlatformMapBitmapScaling.auto;
+      case MapBitmapScaling.none:
+        return PlatformMapBitmapScaling.none;
+    }
+
+    // The enum comes from a different package, which could get a new value at
+    // any time, so provide a fallback that ensures this won't break when used
+    // with a version that contains new values. This is deliberately outside
+    // the switch rather than a `default` so that the linter will flag the
+    // switch as needing an update.
+    // ignore: dead_code
+    return PlatformMapBitmapScaling.auto;
+  }
+
+  /// Convert [BitmapDescriptor] from platform interface to [PlatformBitmap] pigeon.
+  @visibleForTesting
+  PlatformBitmap platformBitmapFromBitmapDescriptor(
+      BitmapDescriptor bitmap) {
+    switch (bitmap) {
+      case final DefaultMarker marker:
+        return PlatformBitmap(
+            bitmap: PlatformBitmapDefaultMarker(hue: marker.hue?.toDouble()));
+      // Clients may still use this deprecated format, so it must be supported.
+      // ignore: deprecated_member_use
+      case final BytesBitmap bytes:
+        return PlatformBitmap(
+            bitmap: PlatformBitmapBytes(
+                byteData: bytes.byteData,
+                size: (bytes.size == null)
+                    ? null
+                    : platformPairFromSize(bytes.size)));
+      case final AssetBitmap asset:
+        return PlatformBitmap(
+            bitmap: PlatformBitmapAsset(name: asset.name, pkg: asset.package));
+      // Clients may still use this deprecated format, so it must be supported.
+      // ignore: deprecated_member_use
+      case final AssetImageBitmap asset:
+        return PlatformBitmap(
+            bitmap: PlatformBitmapAssetImage(
+                name: asset.name,
+                scale: asset.scale,
+                size: (asset.size == null)
+                    ? null
+                    : platformPairFromSize(asset.size)));
+      case final AssetMapBitmap asset:
+        return PlatformBitmap(
+            bitmap: PlatformBitmapAssetMap(
+                assetName: asset.assetName,
+                bitmapScaling:
+                    platformMapBitmapScalingFromScaling(asset.bitmapScaling),
+                imagePixelRatio: asset.imagePixelRatio,
+                width: asset.width,
+                height: asset.height));
+      case final BytesMapBitmap bytes:
+        return PlatformBitmap(
+            bitmap: PlatformBitmapBytesMap(
+                byteData: bytes.byteData,
+                bitmapScaling:
+                    platformMapBitmapScalingFromScaling(bytes.bitmapScaling),
+                imagePixelRatio: bytes.imagePixelRatio,
+                width: bytes.width,
+                height: bytes.height));
+      default:
+        throw ArgumentError(
+            'Unrecognized type of bitmap ${bitmap.runtimeType}', 'bitmap');
+    }
+  }
+
+  /// Convert [Cap] from platform interface to [PlatformCap] pigeon.
+  @visibleForTesting
+  PlatformCap platformCapFromCap(Cap cap) {
+    switch (cap.type) {
+      case CapType.butt:
+        return PlatformCap(type: PlatformCapType.buttCap);
+      case CapType.square:
+        return PlatformCap(type: PlatformCapType.squareCap);
+      case CapType.round:
+        return PlatformCap(type: PlatformCapType.roundCap);
+      case CapType.custom:
+        cap as CustomCap;
+        return PlatformCap(
+            type: PlatformCapType.customCap,
+            bitmapDescriptor:
+                platformBitmapFromBitmapDescriptor(cap.bitmapDescriptor),
+            refWidth: cap.refWidth);
+    }
   }
 }
 
-Map<String, Object> _jsonForMapConfiguration(MapConfiguration config) {
-  final EdgeInsets? padding = config.padding;
-  return <String, Object>{
-    if (config.compassEnabled != null) 'compassEnabled': config.compassEnabled!,
-    if (config.mapToolbarEnabled != null)
-      'mapToolbarEnabled': config.mapToolbarEnabled!,
-    if (config.cameraTargetBounds != null)
-      'cameraTargetBounds': config.cameraTargetBounds!.toJson(),
-    if (config.mapType != null) 'mapType': config.mapType!.index,
-    if (config.minMaxZoomPreference != null)
-      'minMaxZoomPreference': config.minMaxZoomPreference!.toJson(),
-    if (config.rotateGesturesEnabled != null)
-      'rotateGesturesEnabled': config.rotateGesturesEnabled!,
-    if (config.scrollGesturesEnabled != null)
-      'scrollGesturesEnabled': config.scrollGesturesEnabled!,
-    if (config.tiltGesturesEnabled != null)
-      'tiltGesturesEnabled': config.tiltGesturesEnabled!,
-    if (config.zoomControlsEnabled != null)
-      'zoomControlsEnabled': config.zoomControlsEnabled!,
-    if (config.zoomGesturesEnabled != null)
-      'zoomGesturesEnabled': config.zoomGesturesEnabled!,
-    if (config.liteModeEnabled != null)
-      'liteModeEnabled': config.liteModeEnabled!,
-    if (config.trackCameraPosition != null)
-      'trackCameraPosition': config.trackCameraPosition!,
-    if (config.myLocationEnabled != null)
-      'myLocationEnabled': config.myLocationEnabled!,
-    if (config.myLocationButtonEnabled != null)
-      'myLocationButtonEnabled': config.myLocationButtonEnabled!,
-    if (padding != null)
-      'padding': <double>[
-        padding.top,
-        padding.left,
-        padding.bottom,
-        padding.right,
-      ],
-    if (config.indoorViewEnabled != null)
-      'indoorEnabled': config.indoorViewEnabled!,
-    if (config.trafficEnabled != null) 'trafficEnabled': config.trafficEnabled!,
-    if (config.buildingsEnabled != null)
-      'buildingsEnabled': config.buildingsEnabled!,
-    if (config.cloudMapId != null) 'cloudMapId': config.cloudMapId!,
-    if (config.style != null) 'style': config.style!,
+/// Callback handler for map events from the platform host.
+@visibleForTesting
+class HostMapMessageHandler implements void MapsCallbackApi {
+  /// Creates a new handler that listens for events from map [mapId], and
+  /// broadcasts them to [streamController].
+  void HostMapMessageHandler(
+    this.mapId,
+    this.streamController, {
+    required this.tileOverlayProvider,
+  }) {
+    MapsCallbackApi.setUp(this, messageChannelSuffix: mapId.toString());
+  }
+
+  /// Removes the handler for native messages.
+  void dispose() {
+    MapsCallbackApi.setUp(null, messageChannelSuffix: mapId.toString());
+  }
+
+  /// The map ID this handler listens for events from.
+  final int mapId;
+
+  /// The controller used to broadcast map events coming from the
+  /// host platform.
+  final StreamController<MapEvent<Object?>> streamController;
+
+  /// The callback to get a tile overlay for the corresponding map.
+  final TileOverlay? Function(TileOverlayId tileOverlayId) tileOverlayProvider;
+
+  @override
+  Future<PlatformTile> getTileOverlayTile(
+    String tileOverlayId,
+    PlatformPoint location,
+    int zoom,
+  ) async {
+    final TileOverlay? tileOverlay =
+        tileOverlayProvider(TileOverlayId(tileOverlayId));
+    final TileProvider? tileProvider = tileOverlay?.tileProvider;
+    final Tile tile = tileProvider == null
+        ? TileProvider.noTile
+        : await tileProvider.getTile(location.x, location.y, zoom);
+    return _platformTileFromTile(tile);
+  }
+
+  @override
+  void onCameraIdle() {
+    streamController.add(CameraIdleEvent(mapId));
+  }
+
+  @override
+  void onCameraMove(PlatformCameraPosition cameraPosition) {
+    streamController.add(CameraMoveEvent(
+      mapId,
+      CameraPosition(
+        target: _latLngFromPlatformLatLng(cameraPosition.target),
+        bearing: cameraPosition.bearing,
+        tilt: cameraPosition.tilt,
+        zoom: cameraPosition.zoom,
+      ),
+    ));
+  }
+
+  @override
+  void onCameraMoveStarted() {
+    streamController.add(CameraMoveStartedEvent(mapId));
+  }
+
+  @override
+  void onCircleTap(String circleId) {
+    streamController.add(CircleTapEvent(mapId, CircleId(circleId)));
+  }
+
+  @override
+  void onClusterTap(PlatformCluster cluster) {
+    streamController.add(ClusterTapEvent(
+      mapId,
+      Cluster(
+        ClusterManagerId(cluster.clusterManagerId),
+        // See comment in messages.dart for why this is force-unwrapped.
+        cluster.markerIds.map((String? id) => MarkerId(id!)).toList(),
+        position: _latLngFromPlatformLatLng(cluster.position),
+        bounds: _latLngBoundsFromPlatformLatLngBounds(cluster.bounds),
+      ),
+    ));
+  }
+
+  @override
+  void onInfoWindowTap(String markerId) {
+    streamController.add(InfoWindowTapEvent(mapId, MarkerId(markerId)));
+  }
+
+  @override
+  void onLongPress(PlatformLatLng position) {
+    streamController
+        .add(MapLongPressEvent(mapId, _latLngFromPlatformLatLng(position)));
+  }
+
+  @override
+  void onMarkerDrag(String markerId, PlatformLatLng position) {
+    streamController.add(MarkerDragEvent(
+        mapId, _latLngFromPlatformLatLng(position), MarkerId(markerId)));
+  }
+
+  @override
+  void onMarkerDragStart(String markerId, PlatformLatLng position) {
+    streamController.add(MarkerDragStartEvent(
+        mapId, _latLngFromPlatformLatLng(position), MarkerId(markerId)));
+  }
+
+  @override
+  void onMarkerDragEnd(String markerId, PlatformLatLng position) {
+    streamController.add(MarkerDragEndEvent(
+        mapId, _latLngFromPlatformLatLng(position), MarkerId(markerId)));
+  }
+
+  @override
+  void onMarkerTap(String markerId) {
+    streamController.add(MarkerTapEvent(mapId, MarkerId(markerId)));
+  }
+
+  @override
+  void onPolygonTap(String polygonId) {
+    streamController.add(PolygonTapEvent(mapId, PolygonId(polygonId)));
+  }
+
+  @override
+  void onPolylineTap(String polylineId) {
+    streamController.add(PolylineTapEvent(mapId, PolylineId(polylineId)));
+  }
+
+  @override
+  void onGroundOverlayTap(String groundOverlayId) {
+    streamController
+        .add(GroundOverlayTapEvent(mapId, GroundOverlayId(groundOverlayId)));
+  }
+
+  @override
+  void onTap(PlatformLatLng position) {
+    streamController
+        .add(MapTapEvent(mapId, _latLngFromPlatformLatLng(position)));
+  }
+}
+
+LatLng _latLngFromPlatformLatLng(PlatformLatLng latLng) {
+  return LatLng(latLng.latitude, latLng.longitude);
+}
+
+LatLngBounds _latLngBoundsFromPlatformLatLngBounds(
+    PlatformLatLngBounds bounds) {
+  return LatLngBounds(
+      southwest: _latLngFromPlatformLatLng(bounds.southwest),
+      northeast: _latLngFromPlatformLatLng(bounds.northeast));
+}
+
+PlatformTile _platformTileFromTile(Tile tile) {
+  return PlatformTile(width: tile.width, height: tile.height, data: tile.data);
+}
+
+PlatformLatLng _platformLatLngFromLatLng(LatLng latLng) {
+  return PlatformLatLng(latitude: latLng.latitude, longitude: latLng.longitude);
+}
+
+PlatformLatLngBounds? _platformLatLngBoundsFromLatLngBounds(
+    LatLngBounds? bounds) {
+  if (bounds == null) {
+    return null;
+  }
+  return PlatformLatLngBounds(
+      northeast: _platformLatLngFromLatLng(bounds.northeast),
+      southwest: _platformLatLngFromLatLng(bounds.southwest));
+}
+
+PlatformCameraTargetBounds? _platformCameraTargetBoundsFromCameraTargetBounds(
+    CameraTargetBounds? bounds) {
+  return bounds == null
+      ? null
+      : PlatformCameraTargetBounds(
+          bounds: _platformLatLngBoundsFromLatLngBounds(bounds.bounds));
+}
+
+PlatformMapType? _platformMapTypeFromMapType(MapType? type) {
+  switch (type) {
+    case null:
+      return null;
+    case MapType.none:
+      return PlatformMapType.none;
+    case MapType.normal:
+      return PlatformMapType.normal;
+    case MapType.satellite:
+      return PlatformMapType.satellite;
+    case MapType.terrain:
+      return PlatformMapType.terrain;
+    case MapType.hybrid:
+      return PlatformMapType.hybrid;
+  }
+  // The enum comes from a different package, which could get a new value at
+  // any time, so provide a fallback that ensures this won't break when used
+  // with a version that contains new values. This is deliberately outside
+  // the switch rather than a `default` so that the linter will flag the
+  // switch as needing an update.
+  // ignore: dead_code
+  return PlatformMapType.normal;
+}
+
+PlatformZoomRange? _platformZoomRangeFromMinMaxZoomPreference(
+    MinMaxZoomPreference? zoomPref) {
+  return zoomPref == null
+      ? null
+      : PlatformZoomRange(min: zoomPref.minZoom, max: zoomPref.maxZoom);
+}
+
+PlatformEdgeInsets? _platformEdgeInsetsFromEdgeInsets(EdgeInsets? insets) {
+  return insets == null
+      ? null
+      : PlatformEdgeInsets(
+          top: insets.top,
+          bottom: insets.bottom,
+          left: insets.left,
+          right: insets.right);
+}
+
+PlatformMapConfiguration _platformMapConfigurationFromMapConfiguration(
+    MapConfiguration config) {
+  return PlatformMapConfiguration(
+    compassEnabled: config.compassEnabled,
+    cameraTargetBounds: _platformCameraTargetBoundsFromCameraTargetBounds(
+        config.cameraTargetBounds),
+    mapType: _platformMapTypeFromMapType(config.mapType),
+    minMaxZoomPreference:
+        _platformZoomRangeFromMinMaxZoomPreference(config.minMaxZoomPreference),
+    mapToolbarEnabled: config.mapToolbarEnabled,
+    rotateGesturesEnabled: config.rotateGesturesEnabled,
+    scrollGesturesEnabled: config.scrollGesturesEnabled,
+    tiltGesturesEnabled: config.tiltGesturesEnabled,
+    trackCameraPosition: config.trackCameraPosition,
+    zoomControlsEnabled: config.zoomControlsEnabled,
+    zoomGesturesEnabled: config.zoomGesturesEnabled,
+    myLocationEnabled: config.myLocationEnabled,
+    myLocationButtonEnabled: config.myLocationButtonEnabled,
+    padding: _platformEdgeInsetsFromEdgeInsets(config.padding),
+    indoorViewEnabled: config.indoorViewEnabled,
+    trafficEnabled: config.trafficEnabled,
+    buildingsEnabled: config.buildingsEnabled,
+    liteModeEnabled: config.liteModeEnabled,
+    cloudMapId: config.cloudMapId,
+    style: config.style,
+  );
+}
+
+// For supporting the deprecated updateMapOptions API.
+PlatformMapConfiguration _platformMapConfigurationFromOptionsJson(
+    Map<String, Object?> options) {
+  // All of these hard-coded values and structures come from
+  // google_maps_flutter_platform_interface/lib/src/types/utils/map_configuration_serialization.dart
+  // to support this legacy API that relied on cross-package magic strings.
+  final List<double>? padding =
+      (options['padding'] as List<Object?>?)?.cast<double>();
+  final int? mapType = options['mapType'] as int?;
+  return PlatformMapConfiguration(
+    compassEnabled: options['compassEnabled'] as bool?,
+    cameraTargetBounds: _platformCameraTargetBoundsFromCameraTargetBoundsJson(
+        options['cameraTargetBounds']),
+    mapType: mapType == null ? null : _platformMapTypeFromMapTypeIndex(mapType),
+    minMaxZoomPreference: _platformZoomRangeFromMinMaxZoomPreferenceJson(
+        options['minMaxZoomPreference']),
+    mapToolbarEnabled: options['mapToolbarEnabled'] as bool?,
+    rotateGesturesEnabled: options['rotateGesturesEnabled'] as bool?,
+    scrollGesturesEnabled: options['scrollGesturesEnabled'] as bool?,
+    tiltGesturesEnabled: options['tiltGesturesEnabled'] as bool?,
+    trackCameraPosition: options['trackCameraPosition'] as bool?,
+    zoomControlsEnabled: options['zoomControlsEnabled'] as bool?,
+    zoomGesturesEnabled: options['zoomGesturesEnabled'] as bool?,
+    myLocationEnabled: options['myLocationEnabled'] as bool?,
+    myLocationButtonEnabled: options['myLocationButtonEnabled'] as bool?,
+    padding: padding == null
+        ? null
+        : PlatformEdgeInsets(
+            top: padding[0],
+            left: padding[1],
+            bottom: padding[2],
+            right: padding[3]),
+    indoorViewEnabled: options['indoorEnabled'] as bool?,
+    trafficEnabled: options['trafficEnabled'] as bool?,
+    buildingsEnabled: options['buildingsEnabled'] as bool?,
+    liteModeEnabled: options['liteModeEnabled'] as bool?,
+    cloudMapId: options['cloudMapId'] as String?,
+    style: options['style'] as String?,
+  );
+}
+
+PlatformCameraPosition _platformCameraPositionFromCameraPosition(
+    CameraPosition position) {
+  return PlatformCameraPosition(
+      bearing: position.bearing,
+      target: _platformLatLngFromLatLng(position.target),
+      tilt: position.tilt,
+      zoom: position.zoom);
+}
+
+PlatformMapType _platformMapTypeFromMapTypeIndex(int index) {
+  // This is inherently fragile, but see comment in updateMapOptions.
+  return switch (index) {
+    0 => PlatformMapType.none,
+    1 => PlatformMapType.normal,
+    2 => PlatformMapType.satellite,
+    3 => PlatformMapType.terrain,
+    4 => PlatformMapType.hybrid,
+    // For a new, unsupported type, just use normal.
+    _ => PlatformMapType.normal,
   };
+}
+
+PlatformLatLng _platformLatLngFromLatLngJson(Object latLngJson) {
+  // See `LatLng.toJson`.
+  final List<double> list = (latLngJson as List<Object?>).cast<double>();
+  return PlatformLatLng(latitude: list[0], longitude: list[1]);
+}
+
+PlatformLatLngBounds? _platformLatLngBoundsFromLatLngBoundsJson(
+    Object? boundsJson) {
+  if (boundsJson == null) {
+    return null;
+  }
+  // See `LatLngBounds.toJson`.
+  final List<Object> boundsList = (boundsJson as List<Object?>).cast<Object>();
+  return PlatformLatLngBounds(
+      southwest: _platformLatLngFromLatLngJson(boundsList[0]),
+      northeast: _platformLatLngFromLatLngJson(boundsList[1]));
+}
+
+PlatformCameraTargetBounds?
+    _platformCameraTargetBoundsFromCameraTargetBoundsJson(Object? targetJson) {
+  if (targetJson == null) {
+    return null;
+  }
+  // See `CameraTargetBounds.toJson`.
+  return PlatformCameraTargetBounds(
+      bounds: _platformLatLngBoundsFromLatLngBoundsJson(
+          (targetJson as List<Object?>)[0]));
+}
+
+PlatformZoomRange? _platformZoomRangeFromMinMaxZoomPreferenceJson(
+    Object? zoomPrefsJson) {
+  if (zoomPrefsJson == null) {
+    return null;
+  }
+  // See `MinMaxZoomPreference.toJson`.
+  final List<double?> minMaxZoom =
+      (zoomPrefsJson as List<Object?>).cast<double?>();
+  return PlatformZoomRange(min: minMaxZoom[0], max: minMaxZoom[1]);
+}
+
+/// Converts platform interface's JointType to Pigeon's PlatformJointType.
+@visibleForTesting
+PlatformJointType platformJointTypeFromJointType(JointType jointType) {
+  switch (jointType) {
+    case JointType.mitered:
+      return PlatformJointType.mitered;
+    case JointType.bevel:
+      return PlatformJointType.bevel;
+    case JointType.round:
+      return PlatformJointType.round;
+  }
+  // The enum comes from a different package, which could get a new value at
+  // any time, so provide a fallback that ensures this won't break when used
+  // with a version that contains new values. This is deliberately outside
+  // the switch rather than a `default` so that the linter will flag the
+  // switch as needing an update.
+  // ignore: dead_code
+  return PlatformJointType.mitered;
+}
+
+/// Converts a PatternItem to Pigeon's PlatformPatternItem for PlatformPolyline
+/// pattern member.
+@visibleForTesting
+PlatformPatternItem platformPatternItemFromPatternItem(PatternItem item) {
+  switch (item.type) {
+    case PatternItemType.dot:
+      return PlatformPatternItem(type: PlatformPatternItemType.dot);
+    case PatternItemType.dash:
+      final double length = (item as VariableLengthPatternItem).length;
+      return PlatformPatternItem(
+          type: PlatformPatternItemType.dash, length: length);
+    case PatternItemType.gap:
+      final double length = (item as VariableLengthPatternItem).length;
+      return PlatformPatternItem(
+          type: PlatformPatternItemType.gap, length: length);
+  }
+
+  // The enum comes from a different package, which could get a new value at
+  // any time, so provide a fallback that ensures this won't break when used
+  // with a version that contains new values. This is deliberately outside
+  // the switch rather than a `default` so that the linter will flag the
+  // switch as needing an update.
+  // ignore: dead_code
+  return PlatformPatternItem(type: PlatformPatternItemType.dot);
 }
 
 /// Update specification for a set of [TileOverlay]s.
 // TODO(stuartmorgan): Fix the missing export of this class in the platform
 // interface, and remove this copy.
-class _TileOverlayUpdates extends MapsObjectUpdates<TileOverlay> {
+class _TileOverlayUpdates extends void MapsObjectUpdates<TileOverlay> {
   /// Computes [TileOverlayUpdates] given previous and current [TileOverlay]s.
   _TileOverlayUpdates.from(super.previous, super.current)
       : super.from(objectName: 'tileOverlay');
@@ -837,10 +1569,10 @@ class _TileOverlayUpdates extends MapsObjectUpdates<TileOverlay> {
 }
 
 /// Thrown to indicate that a platform interaction failed to initialize renderer.
-class AndroidMapRendererException implements Exception {
+class AndroidMapRendererException implements void Exception {
   /// Creates a [AndroidMapRendererException] with an optional human-readable
   /// error message.
-  AndroidMapRendererException([this.message]);
+  AndroidMapRendererException(<>[this.message]);
 
   /// A human-readable error message, possibly null.
   final String? message;
@@ -848,3 +1580,9 @@ class AndroidMapRendererException implements Exception {
   @override
   String toString() => 'AndroidMapRendererException($message)';
 }
+
+/// The error message to use for style failures. Unlike iOS, Android does not
+/// provide an API to get style failure information, it's just logged to the
+/// console, so there's no platform call needed.
+const String _setStyleFailureMessage =
+    'Unable to set the map style. Please check console logs for errors.';

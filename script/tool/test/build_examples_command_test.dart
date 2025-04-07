@@ -4,10 +4,10 @@
 
 import 'package:args/command_runner.dart';
 import 'package:file/file.dart';
-import 'package:file/memory.dart';
 import 'package:flutter_plugin_tools/src/build_examples_command.dart';
 import 'package:flutter_plugin_tools/src/common/core.dart';
 import 'package:flutter_plugin_tools/src/common/plugin_utils.dart';
+import 'package:git/git.dart';
 import 'package:test/test.dart';
 
 import 'mocks.dart';
@@ -15,21 +15,21 @@ import 'util.dart';
 
 void main() {
   group('build-example', () {
-    late FileSystem fileSystem;
     late MockPlatform mockPlatform;
     late Directory packagesDir;
     late CommandRunner<void> runner;
     late RecordingProcessRunner processRunner;
 
     setUp(() {
-      fileSystem = MemoryFileSystem();
       mockPlatform = MockPlatform();
-      packagesDir = createPackagesDirectory(fileSystem: fileSystem);
-      processRunner = RecordingProcessRunner();
+      final GitDir gitDir;
+      (:packagesDir, :processRunner, gitProcessRunner: _, :gitDir) =
+          configureBaseCommandMocks(platform: mockPlatform);
       final BuildExamplesCommand command = BuildExamplesCommand(
         packagesDir,
         processRunner: processRunner,
         platform: mockPlatform,
+        gitDir: gitDir,
       );
 
       runner = CommandRunner<void>(
@@ -164,6 +164,53 @@ void main() {
           ]));
     });
 
+    test('building for iOS with CocoaPods on master channel', () async {
+      mockPlatform.isMacOS = true;
+      mockPlatform.environment['CHANNEL'] = 'master';
+
+      final RepositoryPackage plugin = createFakePlugin('plugin', packagesDir,
+          platformSupport: <String, PlatformDetails>{
+            platformIOS: const PlatformDetails(PlatformSupport.inline),
+          });
+
+      final Directory pluginExampleDirectory = getExampleDir(plugin);
+
+      final List<String> output = await runCapturingPrint(runner, <String>[
+        'build-examples',
+        '--ios',
+        '--enable-experiment=exp1',
+        '--no-swift-package-manager',
+      ]);
+
+      expect(
+        output,
+        containsAllInOrder(<String>[
+          '\nBUILDING plugin/example for iOS',
+        ]),
+      );
+
+      expect(
+        processRunner.recordedCalls,
+        orderedEquals(<ProcessCall>[
+          ProcessCall(
+            getFlutterCommand(mockPlatform),
+            const <String>['config', '--no-enable-swift-package-manager'],
+            null,
+          ),
+          ProcessCall(
+            getFlutterCommand(mockPlatform),
+            const <String>[
+              'build',
+              'ios',
+              '--no-codesign',
+              '--enable-experiment=exp1'
+            ],
+            pluginExampleDirectory.path,
+          ),
+        ]),
+      );
+    });
+
     test('building for iOS with Swift Package Manager on master channel',
         () async {
       mockPlatform.isMacOS = true;
@@ -198,6 +245,50 @@ void main() {
             const <String>['config', '--enable-swift-package-manager'],
             null,
           ),
+          ProcessCall(
+            getFlutterCommand(mockPlatform),
+            const <String>[
+              'build',
+              'ios',
+              '--no-codesign',
+              '--enable-experiment=exp1'
+            ],
+            pluginExampleDirectory.path,
+          ),
+        ]),
+      );
+    });
+
+    test(
+        'building for iOS with CocoaPods on stable channel does not disable SPM',
+        () async {
+      mockPlatform.isMacOS = true;
+      mockPlatform.environment['CHANNEL'] = 'stable';
+
+      final RepositoryPackage plugin = createFakePlugin('plugin', packagesDir,
+          platformSupport: <String, PlatformDetails>{
+            platformIOS: const PlatformDetails(PlatformSupport.inline),
+          });
+
+      final Directory pluginExampleDirectory = getExampleDir(plugin);
+
+      final List<String> output = await runCapturingPrint(runner, <String>[
+        'build-examples',
+        '--ios',
+        '--enable-experiment=exp1',
+        '--no-swift-package-manager',
+      ]);
+
+      expect(
+        output,
+        containsAllInOrder(<String>[
+          '\nBUILDING plugin/example for iOS',
+        ]),
+      );
+
+      expect(
+        processRunner.recordedCalls,
+        orderedEquals(<ProcessCall>[
           ProcessCall(
             getFlutterCommand(mockPlatform),
             const <String>[
@@ -353,6 +444,47 @@ void main() {
           ]));
     });
 
+    test('building for macOS with CocoaPods on master channel', () async {
+      mockPlatform.isMacOS = true;
+      mockPlatform.environment['CHANNEL'] = 'master';
+
+      final RepositoryPackage plugin = createFakePlugin('plugin', packagesDir,
+          platformSupport: <String, PlatformDetails>{
+            platformMacOS: const PlatformDetails(PlatformSupport.inline),
+          });
+
+      final Directory pluginExampleDirectory = getExampleDir(plugin);
+
+      final List<String> output = await runCapturingPrint(runner,
+          <String>['build-examples', '--macos', '--no-swift-package-manager']);
+
+      expect(
+        output,
+        containsAllInOrder(<String>[
+          '\nBUILDING plugin/example for macOS',
+        ]),
+      );
+
+      expect(
+        processRunner.recordedCalls,
+        orderedEquals(<ProcessCall>[
+          ProcessCall(
+            getFlutterCommand(mockPlatform),
+            const <String>['config', '--no-enable-swift-package-manager'],
+            null,
+          ),
+          ProcessCall(
+            getFlutterCommand(mockPlatform),
+            const <String>[
+              'build',
+              'macos',
+            ],
+            pluginExampleDirectory.path,
+          ),
+        ]),
+      );
+    });
+
     test('building for macOS with Swift Package Manager on master channel',
         () async {
       mockPlatform.isMacOS = true;
@@ -383,6 +515,44 @@ void main() {
             const <String>['config', '--enable-swift-package-manager'],
             null,
           ),
+          ProcessCall(
+            getFlutterCommand(mockPlatform),
+            const <String>[
+              'build',
+              'macos',
+            ],
+            pluginExampleDirectory.path,
+          ),
+        ]),
+      );
+    });
+
+    test(
+        'building for macOS with CocoaPods on stable channel does not disable SPM',
+        () async {
+      mockPlatform.isMacOS = true;
+      mockPlatform.environment['CHANNEL'] = 'stable';
+
+      final RepositoryPackage plugin = createFakePlugin('plugin', packagesDir,
+          platformSupport: <String, PlatformDetails>{
+            platformMacOS: const PlatformDetails(PlatformSupport.inline),
+          });
+
+      final Directory pluginExampleDirectory = getExampleDir(plugin);
+
+      final List<String> output = await runCapturingPrint(runner,
+          <String>['build-examples', '--macos', '--no-swift-package-manager']);
+
+      expect(
+        output,
+        containsAllInOrder(<String>[
+          '\nBUILDING plugin/example for macOS',
+        ]),
+      );
+
+      expect(
+        processRunner.recordedCalls,
+        orderedEquals(<ProcessCall>[
           ProcessCall(
             getFlutterCommand(mockPlatform),
             const <String>[
